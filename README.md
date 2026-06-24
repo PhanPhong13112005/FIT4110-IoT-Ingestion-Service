@@ -1,165 +1,284 @@
-# FIT4110_lab05_docker_compose_readiness
+<div align="center">
 
-**Học phần:** FIT4110 – Dịch vụ kết nối và Công nghệ nền tảng  
-**Buổi 5:** Điều phối đa dịch vụ với Docker Compose, readiness & AI service  
-**Case study:** Smart Campus Operations Platform  
-**Repo nền:** `FIT4110_lab04_docker_packaging`
+# 🏫 FIT4110 — IoT Ingestion Service
 
-> Lab 04 đã chứng minh rằng một API chạy trên máy cá nhân có thể được đóng gói thành container và kiểm thử lại bằng Postman/Newman.  
-> Lab 05 mở rộng tư duy đó: thay vì một container đơn lẻ, chúng ta phải phối hợp **nhiều** dịch vụ thông qua Docker Compose. Đây là bước đệm trực tiếp để tham gia plug‑a‑thon – nơi mọi nhóm gắn kết dịch vụ của mình vào một hệ sinh thái chung.
+### Phân hệ tiếp nhận & xử lý dữ liệu cảm biến cho hệ thống Smart Campus
+
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![MQTT](https://img.shields.io/badge/MQTT-HiveMQ_Cloud-660066?style=for-the-badge&logo=mqtt&logoColor=white)](https://www.hivemq.com/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
+
+</div>
 
 ---
 
-## 1. Ý tưởng nối tiếp từ Lab 04 sang Lab 05
+## 📖 Giới thiệu
 
-Trong Lab 04, luồng làm việc tập trung vào việc kiểm thử một service được đóng gói trong Docker:
+**IoT Ingestion Service** là phân hệ đứng đầu chuỗi xử lý dữ liệu trong kiến trúc **Smart Campus** — hệ thống giám sát môi trường thông minh cho trường học. Service này nhận dữ liệu cảm biến thô (nhiệt độ, độ ẩm, CO₂, khói, pin...) từ các thiết bị ESP32 thông qua MQTT broker HiveMQ Cloud, sau đó **lọc, kiểm tra, chuẩn hóa và phân loại** dữ liệu trước khi chuyển tiếp đến các service xuôi dòng.
 
-```text
-OpenAPI Contract → Service → Dockerfile → Docker image → Docker container → Newman report
+> **Nguyên tắc cốt lõi:** Service này **không** chuyển tiếp nguyên trạng dữ liệu thô.  
+> Nhiệm vụ là biến _raw sensor data_ thành _clean business event_ có ý nghĩa.
+
+---
+
+## 🗺️ Kiến trúc hệ thống
+
+```
+┌─────────────────────┐
+│   Pi IoT Simulator  │  (Giảng viên vận hành, 24/7, mỗi 5 giây)
+└──────────┬──────────┘
+           │ MQTT Publish
+           ▼
+┌─────────────────────────────────┐
+│  Topic: smart-campus/raw/iot/   │
+│         environment             │  ← HiveMQ Cloud (TLS/8883)
+└──────────┬──────────────────────┘
+           │ Subscribe (QoS 1)
+           ▼
+┌──────────────────────────────────────────────────────┐
+│           🔧 IoT Ingestion Service (Repo này)         │
+│                                                      │
+│  [1] VALIDATE → [2] CHECK → [3] NORMALIZE            │
+│              → [4] CLASSIFY → [5] PRODUCE            │
+└──────────┬───────────────────────────────────────────┘
+           │ MQTT Publish (QoS 1)
+           ▼
+┌─────────────────────────────────┐
+│  Topic: smart-campus/events/    │
+│         sensor                  │
+└────────┬──────────┬─────────────┘
+         │          │
+         ▼          ▼
+  Core Business   Analytics
+    Service        Service
 ```
 
-Lab 05 mở rộng luồng đó thành:
+---
 
-```text
-OpenAPI Contract
-→ Service thật (API)
-→ AI service (ví dụ YOLO v8 hoặc model mock)
-→ Database (PostgreSQL hoặc TimescaleDB)
-→ Docker Compose định nghĩa toàn bộ stack
-→ Nhiều container cùng chạy trên mạng nội bộ `team-internal`
-→ Service API gọi được AI và DB qua nội bộ
-→ Postman/Newman test lại stack end‑to‑end
-→ Evidence (report, log, screenshots)
+## ⚙️ Pipeline xử lý dữ liệu (5 bước)
+
+Toàn bộ logic nghiệp vụ được thực thi tuần tự trong callback `on_message()` của `main.py`:
+
+### Bước 1 — 🛡️ VALIDATE: Kiểm tra schema đầu vào
+
+Kiểm tra payload có đủ **7 trường bắt buộc** không. Nếu thiếu → log lỗi và **từ chối ngay, không publish**.
+
+```python
+REQUIRED_FIELDS = [
+    "event_id", "event_type", "timestamp", "device_id",
+    "temperature_c", "humidity_percent", "motion_detected"
+]
 ```
 
-Thông điệp chính của buổi học:
-
-> Một container đơn lẻ chưa đủ – các service thực tế luôn phải tương tác với cơ sở dữ liệu và/hoặc AI/ML.  
-> Docker Compose giúp định nghĩa mối quan hệ giữa chúng, nhưng mỗi service vẫn phải tuân thủ các nguyên tắc về readiness, health check và môi trường.
-
----
-
-## 2. Mục tiêu sau buổi lab
-
-Sau khi hoàn thành Lab 05, mỗi nhóm cần làm được:
-
-- Viết `docker-compose.yml` để định nghĩa ít nhất ba service: API, AI (hoặc worker) và database.
-- Dùng network `team-internal` để giao tiếp nội bộ và tham gia mạng chung `class-net` khi cần thiết.
-- Chạy API bằng non‑root user trong container và giữ nguyên `HEALTHCHECK` như Lab 04.
-- Thêm healthcheck cho DB (`pg_isready`) và AI service để Compose biết khi nào container sẵn sàng.
-- Tách cấu hình runtime qua `.env.example` (ví dụ `APP_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SERVICE_VERSION`, `AUTH_TOKEN`).
-- Không commit secret thật vào repo.
-- Triển khai `Makefile` hoặc script để nhanh chóng chạy Compose (`make compose-up`, `make compose-down`).
-- Viết `RUN_COMPOSE.md` hướng dẫn người khác clone và chạy lại toàn bộ stack.
-- Chạy lại Postman/Newman để kiểm thử API trong môi trường Compose (có thể tái sử dụng collection và environment của Lab 04).
-- Soạn **checklists/readiness-checklist.md** mô tả checklist readiness 6 điểm (sẵn sàng DB, AI, token, port, network, version) và tick khi hoàn thành.
-- Cung cấp bằng chứng (screenshot/ảnh, báo cáo test) trong thư mục `reports/`.
+| Trường             | Kiểu              | Bắt buộc |
+| ------------------ | ----------------- | :------: |
+| `event_id`         | string            |    ✅    |
+| `event_type`       | string            |    ✅    |
+| `timestamp`        | string (ISO 8601) |    ✅    |
+| `device_id`        | string            |    ✅    |
+| `temperature_c`    | number / null     |    ✅    |
+| `humidity_percent` | number / null     |    ✅    |
+| `motion_detected`  | boolean           |    ✅    |
 
 ---
 
-## 3. Cấu trúc repo
+### Bước 2 — 🔍 CHECK: Kiểm tra thiết bị trong registry
 
-```text
-FIT4110_lab05_docker_compose_readiness/
-├── README.md
-├── RUN_COMPOSE.md
-├── Dockerfile
-├── docker-compose.yml
-├── .dockerignore
-├── .env.example
-├── Makefile
-├── requirements.txt
-├── src/
-│   ├── iot_app/
-│   │   ├── __init__.py
-│   │   └── main.py
-│   └── ai_service/
-│       └── main.py
-├── contracts/
-│   └── iot-ingestion.openapi.yaml
-├── postman/
-│   └── environments/
-│       └── FIT4110_lab05_local.postman_environment.json
-├── checklists/
-│   └── readiness-checklist.md
-└── reports/
+Đối chiếu `device_id` với danh sách thiết bị hợp lệ được load từ `device_registry.csv` khi service khởi động.
+
+```
+device_id không có trong registry
+  → status = invalid_device | alert_level = high | reason = device_not_registered
+  → PRODUCE ngay, dừng pipeline
 ```
 
-Thư mục `src/iot_app` chứa API FastAPI giống Lab 04. Thư mục `src/ai_service` chứa service AI mẫu (giả lập), cung cấp một endpoint `/predict` trả về kết quả dummy. Nhóm có thể thay bằng mô hình thực tế (YOLOv8, MediaPipe…).
+Cấu trúc `device_registry.csv`:
+
+```csv
+device_id,device_type,location,room,status
+esp32-lab-a101,environment_sensor,Lab A101,A101,active
+esp32-lab-a102,environment_sensor,Lab A102,A102,active
+esp32-gate-a,environment_sensor,Main Gate A,GATE-A,active
+esp32-library-01,environment_sensor,Library 01,LIB-01,active
+esp32-hall-b201,environment_sensor,Hall B201,B201,active
+```
 
 ---
 
-## 4. Chuẩn bị môi trường
+### Bước 3 — 🔧 NORMALIZE: Chuẩn hóa dữ liệu
 
-Trước khi chạy compose, hãy cài:
+Ba thao tác chuẩn hóa bắt buộc:
 
-- **Git** để clone repo.
-- **Docker Desktop** hoặc Docker Engine hỗ trợ Compose v2.
-- **Node.js 20.x LTS** và `npm` nếu muốn chạy Newman/Prism/Spectral.
-- **Postman Desktop** hoặc Postman Web.
+| Thao tác            | Mô tả                                                                                                                               |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **Timestamp**       | Kiểm tra ISO 8601 bằng `datetime.fromisoformat()`. Nếu sai → tự động thay bằng UTC hiện tại                                         |
+| **Kiểu số**         | Kiểm tra `temperature_c`, `humidity_percent`, `co2_ppm`, `smoke_ppm`, `battery_percent` có phải số hợp lệ không. `bool` bị loại trừ |
+| **Xóa field debug** | `data.pop("scenario_hint_for_teacher", None)` — tuyệt đối không gửi field này sang downstream                                       |
 
-Sau khi clone, cài dependencies phục vụ Prism, Spectral và Newman (tùy chọn):
+---
+
+### Bước 4 — 🏷️ CLASSIFY: Phân loại trạng thái môi trường
+
+Áp dụng bảng rule theo thứ tự ưu tiên **sensor_error → danger → warning → normal**:
+
+| Mức độ          | Điều kiện                         | `status`       | `alert_level` | `reason`               |
+| --------------- | --------------------------------- | -------------- | ------------- | ---------------------- |
+| 🔴 Lỗi cảm biến | `temp is None` HOẶC `hum is None` | `sensor_error` | `medium`      | `missing_sensor_value` |
+| 🔴 Nguy hiểm    | `temperature_c >= 40`             | `danger`       | `high`        | `temperature_too_high` |
+| 🔴 Nguy hiểm    | `co2_ppm >= 1800`                 | `danger`       | `high`        | `co2_too_high`         |
+| 🔴 Nguy hiểm    | `smoke_ppm >= 1.0`                | `danger`       | `high`        | `smoke_detected`       |
+| 🟡 Cảnh báo     | `temperature_c >= 35`             | `warning`      | `medium`      | `temperature_high`     |
+| 🟡 Cảnh báo     | `humidity_percent >= 85`          | `warning`      | `medium`      | `humidity_too_high`    |
+| 🟡 Cảnh báo     | `co2_ppm >= 1200`                 | `warning`      | `medium`      | `co2_high`             |
+| 🟡 Cảnh báo     | `smoke_ppm >= 0.5`                | `warning`      | `medium`      | `smoke_warning`        |
+| 🟡 Cảnh báo     | `battery_percent < 20`            | `warning`      | `medium`      | `low_battery`          |
+| 🟢 Bình thường  | Không rơi vào điều kiện nào       | `normal`       | `none`        | `environment_normal`   |
+
+---
+
+### Bước 5 — 📤 PRODUCE: Đóng gói & Publish
+
+Tạo processed event và publish lên output topic với **QoS 1** (at-least-once delivery).
+
+```python
+processed_event.update({
+    "event_id":       str(uuid.uuid4()),          # UUID mới
+    "event_type":     "sensor.reading.processed", # Ghi đè
+    "source_service": "team-iot",
+    "timestamp":      now_iso(),                  # UTC hiện tại
+    "raw_event_id":   raw_data.get("event_id"),   # Giữ ID gốc để trace
+    "status":         status,
+    "alert_level":    alert_level,
+    "reason":         reason
+})
+client.publish(OUTPUT_TOPIC, json.dumps(processed_event), qos=1)
+```
+
+---
+
+## 📡 Giao thức MQTT
+
+| Thuộc tính       | Giá trị                                               |
+| ---------------- | ----------------------------------------------------- |
+| **Broker**       | `f6f78e87db4a4c189dd3d706745a5e93.s1.eu.hivemq.cloud` |
+| **Port**         | `8883` (TLS) / `8884` (WebSocket TLS)                 |
+| **Protocol**     | MQTTv5 over TLS (`ssl.PROTOCOL_TLS_CLIENT`)           |
+| **Input Topic**  | `smart-campus/raw/iot/environment`                    |
+| **Output Topic** | `smart-campus/events/sensor`                          |
+| **QoS**          | 1 (at-least-once)                                     |
+
+### Payload mẫu — Input (raw từ Pi Simulator)
+
+```json
+{
+  "event_id": "raw-iot-abc123",
+  "event_type": "iot.environment.sampled",
+  "source_service": "pi-iot-simulator",
+  "device_id": "esp32-lab-a101",
+  "timestamp": "2026-06-07T14:30:10+07:00",
+  "location": "Lab A101",
+  "temperature_c": 31.2,
+  "humidity_percent": 68.5,
+  "motion_detected": false,
+  "co2_ppm": 650,
+  "smoke_ppm": 0.02,
+  "battery_percent": 87,
+  "scenario_hint_for_teacher": "normal"
+}
+```
+
+### Payload mẫu — Output (processed event)
+
+```json
+{
+  "event_id": "a3f7c2d1-84b0-4e5f-9c12-1a2b3c4d5e6f",
+  "event_type": "sensor.reading.processed",
+  "source_service": "team-iot",
+  "timestamp": "2026-06-07T07:30:11.123456+00:00",
+  "raw_event_id": "raw-iot-abc123",
+  "device_id": "esp32-lab-a101",
+  "location": "Lab A101",
+  "temperature_c": 31.2,
+  "humidity_percent": 68.5,
+  "motion_detected": false,
+  "co2_ppm": 650,
+  "smoke_ppm": 0.02,
+  "battery_percent": 87,
+  "status": "normal",
+  "alert_level": "none",
+  "reason": "environment_normal"
+}
+```
+
+---
+
+## 🚀 Hướng dẫn cài đặt & triển khai
+
+### Yêu cầu hệ thống
+
+| Công cụ                                            | Phiên bản tối thiểu               |
+| -------------------------------------------------- | --------------------------------- |
+| [Docker](https://docs.docker.com/get-docker/)      | 24.x trở lên                      |
+| [Docker Compose](https://docs.docker.com/compose/) | v2.x trở lên (plugin)             |
+| Kết nối Internet                                   | Cần thiết để kết nối HiveMQ Cloud |
+
+### Các bước triển khai
+
+**1. Clone repository**
 
 ```bash
-npm install
+git clone https://github.com/<your-username>/FIT4110-IoT-Ingestion-Service.git
+cd FIT4110-IoT-Ingestion-Service
 ```
 
-Kiểm tra phiên bản:
+**2. Tạo network liên nhóm (chỉ làm một lần)**
 
 ```bash
-docker compose version
-docker --version
-node --version
-npx newman --version
-npx prism --version
+docker network create class-net
 ```
 
----
-
-## 5. Chạy API local không dùng Docker
-
-Các bước giống Lab 04:
+**3. Cấu hình biến môi trường**
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn iot_app.main:app --app-dir src --host 0.0.0.0 --port 8000
+cp .env.example .env
 ```
 
-Kiểm tra health:
+Mở file `.env` và điền các giá trị thực:
 
 ```bash
-curl http://localhost:8000/health
+# Bắt buộc phải điền
+MQTT_PASSWORD=<mật_khẩu_hivemq>
+POSTGRES_PASSWORD=<mật_khẩu_postgres>
+AUTH_TOKEN=<secret_token_của_nhóm>
+
+# Điền IP máy nhóm bạn khi demo trên lớp
+CORE_SERVICE_URL=http://<IP_NHOM_CORE>:8000
+ANALYTICS_SERVICE_URL=http://<IP_NHOM_ANALYTICS>:8000
 ```
 
----
-
-## 6. Điều phối đa dịch vụ với Docker Compose
-
-File `docker-compose.yml` định nghĩa 3 service: `api`, `db` và `ai-service`. Các biến môi trường được đặt trong `.env.example` và các volume/network được khai báo rõ ràng.
-
-Chạy compose (build & run):
+**4. Build và khởi động toàn bộ stack**
 
 ```bash
 docker compose up -d --build
 ```
 
-Compose sẽ kéo hoặc build image, tạo mạng `team-internal`, gắn volume DB và khởi động lần lượt `db` → `ai-service` → `api`. Bạn có thể theo dõi log:
+**5. Kiểm tra trạng thái**
 
 ```bash
-docker compose logs -f
+# Xem tất cả container
+docker compose ps
+
+# Kiểm tra health endpoint
+curl http://localhost:8000/health
+
+# Theo dõi log pipeline real-time
+docker compose logs -f api
 ```
 
-Kiểm tra readiness của từng service:
-
-- API: `curl http://localhost:8000/health`
-- DB: `docker exec -it fit4110-db-lab05 pg_isready -U $POSTGRES_USER`
-- AI: `curl http://localhost:9000/health` (service mẫu trả về JSON đơn giản)
-
-Sau khi stack đã sẵn sàng, chạy lại Postman collection giống Lab 04 (sửa `baseUrl` thành `http://localhost:8000`).
-
-Dừng toàn bộ stack:
+**6. Dừng hệ thống**
 
 ```bash
 docker compose down
@@ -167,108 +286,89 @@ docker compose down
 
 ---
 
-## 7. Readiness checklist
+## 🔐 Cấu hình biến môi trường
 
-Phần này ghi lại checklist readiness cần kiểm tra trước khi tuyên bố stack sẵn sàng. Xem file [`checklists/readiness-checklist.md`](checklists/readiness-checklist.md) để biết chi tiết và tick vào các mục như:
+Tất cả cấu hình được quản lý qua file `.env`. **Không bao giờ commit file `.env` lên Git.**
 
-- DB đã khởi động và sẵn sàng (`pg_isready`).
-- AI service đã tải mô hình (nếu có) và có health check trả 200.
-- API có thể kết nối DB và AI (ví dụ tạo một reading thành công).
-- Các biến môi trường (.env) được đặt đúng, không dùng secret thật.
-- `team-internal` network hoạt động; service có thể gọi nội bộ qua tên container.
-- Version/tag của từng image được cập nhật đúng quy ước (vd: `v0.1.0-team-iot`).
+| Biến                    | Mặc định          | Bắt buộc | Mô tả                                      |
+| ----------------------- | ----------------- | :------: | ------------------------------------------ |
+| `APP_PORT`              | `8000`            |    ❌    | Port expose của service api                |
+| `AUTH_TOKEN`            | —                 |    ✅    | Token xác thực API nội bộ                  |
+| `POSTGRES_USER`         | `lab05`           |    ❌    | Username PostgreSQL                        |
+| `POSTGRES_PASSWORD`     | —                 |    ✅    | Mật khẩu PostgreSQL                        |
+| `POSTGRES_DB`           | `iotdb`           |    ❌    | Tên database                               |
+| `CORE_SERVICE_URL`      | —                 |    ✅    | URL service nhóm Core (điền khi demo)      |
+| `ANALYTICS_SERVICE_URL` | —                 |    ✅    | URL service nhóm Analytics (điền khi demo) |
+| `MQTT_HOST`             | `...hivemq.cloud` |    ❌    | HiveMQ broker hostname                     |
+| `MQTT_PORT`             | `8883`            |    ❌    | Port MQTTS                                 |
+| `MQTT_USERNAME`         | `DVKN_IOT_2026`   |    ❌    | Username HiveMQ                            |
+| `MQTT_PASSWORD`         | —                 |    ✅    | Mật khẩu HiveMQ                            |
 
 ---
 
-## 8. Các lệnh nhanh bằng Makefile
+## 🧩 Cấu trúc dự án
 
-Makefile cung cấp các lệnh tiện lợi:
-
-```bash
-make compose-up      # build và chạy compose stack
-make compose-down    # stop và remove stack
-make logs            # theo dõi log của các service
-make test-compose    # chạy newman test trên compose (tùy chọn)
 ```
-
-Bạn có thể mở Makefile để chỉnh sửa thêm các mục.
-
----
-
-## 9. Bài làm của từng nhóm
-
-Mỗi nhóm dùng repo này làm mẫu và thay thế service trong `src/` bằng service của mình.
-
-| Nhóm         | Cần thay đổi |
-|--------------|-------------|
-| `team-iot`   | Có thể sử dụng API IoT mẫu, thêm DB TimescaleDB nếu muốn. |
-| `team-camera`| Thay `src/ai_service` bằng service Camera Stream & AI inference, cập nhật port và health. |
-| `team-gate`  | Kết nối API với Access Gate service, lưu ý biến môi trường DB cho cổng, bỏ AI nếu không cần. |
-| `team-vision`| Thay `ai_service` bằng mô hình YOLOv8/MediaPipe; đảm bảo container đủ dependency CUDA khi cần. |
-| `team-analytics`| Thay DB bằng TimescaleDB, service analytics sẽ đọc dữ liệu và trả về thống kê. |
-| `team-core`  | Thay API thành policy engine; có thể bỏ AI/DB nếu không dùng. |
-| `team-notify`| Thay API thành Notification service, thêm RabbitMQ hoặc gửi email/SMS; không commit token thật. |
-
----
-
-## 10. Điều kiện hoàn thành Lab 05
-
-Một nhóm được xem là hoàn thành Lab 05 khi:
-
-- `docker-compose.yml` khởi tạo ít nhất 3 container và khai báo đúng network/volume.
-- Mỗi service có `HEALTHCHECK` và container được chạy bằng user non‑root (nếu tự build).
-- `.dockerignore`, `.env.example`, `RUN_COMPOSE.md` đầy đủ, không rò rỉ secret.
-- `db` và `ai-service` sẵn sàng trước khi API start (Compose `depends_on` và health check). 
-- Postman/Newman test pass trên API khi chạy trong stack Compose.
-- Có report trong `reports/` (XML/HTML) và evidence log/ảnh chụp health.
-- Version/tag của image tuân theo quy ước `v0.1.0-<team>`, push lên registry (ghcr.io hoặc Docker Hub).
-
----
-
-## 11. Artefact cần nộp
-
-```text
-docker-compose.yml
-.dockerignore
-.env.example
-RUN_COMPOSE.md
-contracts/<team>.openapi.yaml
-postman/environments/<team>_local.postman_environment.json
-reports/newman-lab05-compose.xml
-reports/newman-lab05-compose.html
-ảnh chụp /health hoặc log container
-tag image đã push lên registry
-checklists/readiness-checklist.md (đã tick các mục)
+FIT4110-IoT-Ingestion-Service/
+├── src/
+│   ├── iot_app/
+│   │   ├── main.py                 # 🔑 Core pipeline: VALIDATE→CHECK→NORMALIZE→CLASSIFY→PRODUCE
+│   │   └── device_registry.csv     # Danh sách thiết bị ESP32 hợp lệ
+│   └── ai_service/
+│       └── main.py                 # AI Service phụ trợ (port 9000)
+├── docker-compose.yml              # Orchestration: api + db + ai-service
+├── Dockerfile                      # Build image cho IoT Ingestion Service
+├── requirements.txt                # Python dependencies
+├── .env.example                    # Template biến môi trường (safe to commit)
+├── .env                            # ⚠️ Cấu hình thực — KHÔNG commit lên Git
+├── .gitignore
+└── README.md
 ```
 
 ---
 
-## 12. Rubric gợi ý
+## 🩺 Health Check API
 
-| Tiêu chí                                              | Điểm |
-|-------------------------------------------------------|-----:|
-| `docker-compose.yml` đúng, build & run được           | 2.0 |
-| Các container sẵn sàng, `/health` và DB/AI pass        | 2.0 |
-| Non‑root, `.dockerignore`, `.env.example` tốt         | 1.5 |
-| Newman/Postman test pass trên stack Compose           | 2.0 |
-| `RUN_COMPOSE.md` rõ ràng, người khác chạy lại được    | 1.5 |
-| Evidence đầy đủ: log/report/image tag & checklist     | 1.0 |
-| **Tổng**                                             | **10.0** |
+| Endpoint  | Method | Mô tả                       |
+| --------- | ------ | --------------------------- |
+| `/health` | `GET`  | Kiểm tra trạng thái service |
+
+**Response mẫu:**
+
+```json
+{
+  "status": "ok",
+  "service": "iot-ingestion",
+  "version": "1.0.0",
+  "devices_loaded": 5,
+  "input_topic": "smart-campus/raw/iot/environment",
+  "output_topic": "smart-campus/events/sensor"
+}
+```
 
 ---
 
-## 13. Tinh thần của buổi học
+## 🐛 Troubleshooting
 
-Sau Buổi 4, nhóm đã chứng minh:
+| Triệu chứng                              | Nguyên nhân có thể                                 | Giải pháp                                               |
+| ---------------------------------------- | -------------------------------------------------- | ------------------------------------------------------- |
+| Container `api` ở trạng thái `unhealthy` | `db` hoặc `ai-service` chưa sẵn sàng               | Chờ healthcheck pass, kiểm tra `docker compose logs db` |
+| Không nhận được message MQTT             | Sai credential hoặc mất kết nối TLS                | Kiểm tra `MQTT_USERNAME`, `MQTT_PASSWORD` trong `.env`  |
+| `[REGISTRY] KHÔNG TÌM THẤY file`         | `device_registry.csv` chưa có trong `src/iot_app/` | Đảm bảo file CSV tồn tại đúng đường dẫn                 |
+| Network `class-net` not found            | Chưa tạo external network                          | Chạy `docker network create class-net`                  |
+| `[VALIDATE] Thiếu N trường bắt buộc`     | Simulator đang gửi payload không đúng schema       | Kiểm tra log Pi Simulator, liên hệ giảng viên           |
 
-```text
-API có thể chạy trong container và được kiểm thử tự động.
-```
+---
 
-Sau Buổi 5, nhóm cần chứng minh thêm:
+## 📄 License
 
-```text
-Hệ thống nhiều service có thể phối hợp trơn tru thông qua Docker Compose, với readiness rõ ràng và kiểm thử end‑to‑end.
-```
+Distributed under the MIT License. See `LICENSE` for more information.
 
-Điều này là tiền đề để chuẩn bị cho plug‑a‑thon, nơi các nhóm sẽ “cắm vào” hệ sinh thái chung của lớp và vận hành nhiều service cùng lúc.
+---
+
+<div align="center">
+
+**FIT4110 — Dịch vụ Kết nối và Nền tảng Nội dung Thông minh**  
+IoT Ingestion Service v1.0.0 · Smart Campus Project
+
+</div>
