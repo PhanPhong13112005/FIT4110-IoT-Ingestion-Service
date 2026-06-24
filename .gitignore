@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# --- Virtual Environment ---
+.venv/
+venv/
+ENV/
+
+# --- Environment Variables (BẢO MẬT) ---
+.env
+.env.*
+!.env.example
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Docker ---
+docker-compose.override.yml
+
+# --- Node ---
+node_modules/
+package-lock.json
+
+# --- Test / Reports ---
+.coverage
+htmlcov/
+.pytest_cache/
+reports/*.html
+reports/*.xml
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+*.log
