@@ -34,15 +34,14 @@ OUTPUT_TOPIC = "smart-campus/events/sensor"
 app = FastAPI(title="FIT4110 Lab 05 - IoT Ingestion", version=SERVICE_VERSION)
 mqtt_client: Optional[mqtt.Client] = None
 
-# 7 trường bắt buộc theo đề bài (Mục 1 - VALIDATE)
+
 REQUIRED_FIELDS = [
     "event_id", "event_type", "timestamp", "device_id",
     "temperature_c", "humidity_percent", "motion_detected"
 ]
 
-# Các trường sensor cần kiểm tra kiểu số (Mục 3 - NORMALIZE)
 NUMERIC_SENSOR_FIELDS = [
-    "temperature_c", "humidity_percent", "co2_ppm",
+    "temperature_c", "humidity_percent", "light_lux", "co2_ppm",
     "smoke_ppm", "battery_percent"
 ]
 
@@ -140,11 +139,26 @@ def normalize_data(data: Dict) -> Tuple[Dict, Optional[str]]:
     # 3b. Kiểm tra kiểu dữ liệu số cho từng sensor field
     for field in NUMERIC_SENSOR_FIELDS:
         value = data.get(field)
-        if value is not None and not is_number(value):
-            print(f"⚠️ [NORMALIZE] Trường '{field}' không phải số: {value} ({type(value).__name__})", flush=True)
-            return data, field  # Trả về tên field lỗi
+        if value is not None:
+            if isinstance(value, str):
+                try:
+                    data[field] = float(value)
+                except ValueError:
+                    print(f"⚠️ [NORMALIZE] Trường '{field}' không thể ép kiểu số: {value}", flush=True)
+                    return data, field
+            elif not is_number(value):
+                print(f"⚠️ [NORMALIZE] Trường '{field}' sai kiểu: {value} ({type(value).__name__})", flush=True)
+                return data, field  # Trả về tên field lỗi
 
-    # 3c. Loại bỏ field debug (giảng viên KHÔNG cho phép dùng)
+    # 3c. Ép kiểu boolean cho motion_detected
+    motion = data.get("motion_detected")
+    if isinstance(motion, str):
+        if motion.lower() == "true":
+            data["motion_detected"] = True
+        elif motion.lower() == "false":
+            data["motion_detected"] = False
+
+    # 3d. Loại bỏ field debug (giảng viên KHÔNG cho phép dùng)
     data.pop("scenario_hint_for_teacher", None)
 
     return data, None
@@ -224,16 +238,23 @@ def produce_event(client, raw_data: Dict, status: str,
     })
 
     payload_json = json.dumps(processed_event)
-    client.publish(OUTPUT_TOPIC, payload_json, qos=1)
+    msg_info = client.publish(OUTPUT_TOPIC, payload_json, qos=1)
 
-    print(f"📤 [PRODUCE] Publish → {OUTPUT_TOPIC} | "
-          f"status={status} | alert={alert_level} | reason={reason}", flush=True)
+    if msg_info.rc != mqtt.MQTT_ERR_SUCCESS:
+        print(f"❌ [PRODUCE ERROR] Lỗi không thể đẩy dữ liệu lên hàng đợi (mã lỗi: {msg_info.rc})", flush=True)
+    else:
+        print(f"📤 [PRODUCE] Chuẩn bị gửi (mid={msg_info.mid}) → {OUTPUT_TOPIC} | "
+              f"status={status} | alert={alert_level} | reason={reason}", flush=True)
+        
+        # Thêm log hiển thị rõ các thuộc tính theo nhu cầu của Core và Analytics
+        core_keys = [k for k in ["status", "alert_level", "reason", "temperature_c", "co2_ppm", "smoke_ppm", "motion_detected"] if k in processed_event and processed_event[k] is not None]
+        ana_keys = [k for k in ["temperature_c", "humidity_percent", "co2_ppm", "smoke_ppm", "battery_percent", "status", "alert_level"] if k in processed_event and processed_event[k] is not None]
+        
+        print(f"   ├── Đã gửi thuộc tính {', '.join(core_keys)} đến Core", flush=True)
+        print(f"   └── Đã gửi thuộc tính {', '.join(ana_keys)} đến ana", flush=True)
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║          PIPELINE: VALIDATE → CHECK → NORMALIZE              ║
-# ║                    → CLASSIFY → PRODUCE                      ║
-# ╚══════════════════════════════════════════════════════════════╝
+
 def on_message(client, userdata, message):
     """Callback xử lý mỗi message MQTT nhận được."""
     try:
@@ -246,20 +267,20 @@ def on_message(client, userdata, message):
               f"smoke={raw_data.get('smoke_ppm')} | batt={raw_data.get('battery_percent')}",
               flush=True)
 
-        # ──── MỤC 1: VALIDATE ────
         missing_fields = validate_schema(raw_data)
         if missing_fields:
             print(f"❌ [REJECTED] {json.dumps({'error': 'missing_required_field', 'missing_fields': missing_fields})}",
                   flush=True)
             return  # KHÔNG publish
 
-        # ──── MỤC 2: CHECK thiết bị ────
         if not check_device(device_id):
             status, alert_level, reason = "invalid_device", "high", "device_not_registered"
-            # Vẫn normalize trước khi produce
             raw_data, _ = normalize_data(raw_data)
             produce_event(client, raw_data, status, alert_level, reason)
             return
+        
+        # Nếu thiết bị hợp lệ, đồng bộ vị trí (location) từ registry để chống sai lệch từ sensor
+        raw_data["location"] = device_registry[device_id].get("location", raw_data.get("location"))
 
         # ──── MỤC 3: NORMALIZE ────
         raw_data, bad_field = normalize_data(raw_data)
@@ -280,9 +301,19 @@ def on_message(client, userdata, message):
         print(f"❌ [PIPELINE ERROR] {e}", flush=True)
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                    APP SETUP (FastAPI)                       ║
-# ╚══════════════════════════════════════════════════════════════╝
+def on_connect_callback(client, userdata, flags, reason_code, properties=None):
+    """Kiểm tra mã lỗi trả về khi kết nối MQTT broker."""
+    if str(reason_code) == "Success" or reason_code == 0:
+        print(f"✅ [MQTT] Kết nối THÀNH CÔNG! (Reason: {reason_code})", flush=True)
+        client.subscribe(INPUT_TOPIC, qos=1)
+        print(f"✅ [MQTT] Subscribed: {INPUT_TOPIC}", flush=True)
+    else:
+        print(f"❌ [MQTT] Kết nối THẤT BẠI. Reason: {reason_code}", flush=True)
+
+def on_publish_callback(client, userdata, mid, *args):
+    """Xác nhận broker đã nhận được gói tin (QoS 1) dành cho Core và Analytics."""
+    print(f"📬 [MQTT OUT] Xác nhận (mid={mid}) đã GỬI THÀNH CÔNG cho Core & Analytics!", flush=True)
+
 @app.on_event("startup")
 def startup_event():
     global mqtt_client
@@ -290,11 +321,9 @@ def startup_event():
         mqtt_client = mqtt.Client(protocol=mqtt.MQTTv5)
         mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
         mqtt_client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
-        mqtt_client.on_connect = lambda c, u, f, r, p=None: (
-            c.subscribe(INPUT_TOPIC, qos=1),
-            print(f"✅ [MQTT] Subscribed: {INPUT_TOPIC}", flush=True)
-        )
+        mqtt_client.on_connect = on_connect_callback
         mqtt_client.on_message = on_message
+        mqtt_client.on_publish = on_publish_callback
         mqtt_client.connect(MQTT_HOST, MQTT_PORT)
         mqtt_client.loop_start()
         print(f"🚀 [SYSTEM] IoT Ingestion Service v{SERVICE_VERSION} started!", flush=True)
